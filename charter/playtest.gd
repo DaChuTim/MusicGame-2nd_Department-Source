@@ -9,7 +9,8 @@ const PERFECT_MS := 65.0
 const GREAT_MS := 115.0
 const GOOD_MS := 170.0
 ## Estella 式 BAD 档：超出 GOOD 但在这一档内算 BAD（不断连、不计命中）。
-const BAD_MS := 250.0
+## 收窄到 200ms：与下一颗的窗口重叠更少，前一颗不容易把按键吃掉。
+const BAD_MS := 200.0
 const HIT_WINDOW_MS := BAD_MS
 ## 早按只认这么多：更早的按键不消耗音符，可以再按一次。
 ## 收到 GREAT 边界，误按早一点点不会把音符判成 GOOD。
@@ -18,6 +19,10 @@ const EARLY_MS := 115.0
 const PRESS_KEEP_MS := 34.0
 ## 同一个键 50ms 内的重复按下只算一次（手抖双击）。
 const KEY_DEBOUNCE_MS := 50.0
+## 滚轮反向之后，这么短时间内的再次反向滚动不计：上下交替蹭轮凑不出有效方向。
+const SEEK_REVERSE_GUARD_MS := 80.0
+## 双押 Anchor：两颗锚点的两次按键要在这么短时间内按下才算“同时”。
+const ANCHOR_SYNC_MS := 40.0
 ## 鼠标左右键当成两个独立“按键”（和键盘两键一样），用负数避开 Key 枚举。
 const MOUSE_KEY_LEFT := -2
 const MOUSE_KEY_RIGHT := -3
@@ -47,16 +52,14 @@ const TAIL_GREAT_MS := 220.0
 const TAIL_GOOD_MS := 350.0
 ## maimai 的尾区停留最多把 Perfect/Great 的早到窗口扩到 22 帧（366.7ms）。
 const TAIL_EXT_MAX_MS := 366.6667
-const TRACE_HEAD_RADIUS := 72.0
-const TRACE_CONTACT_PX := 56.0
 ## 位置判定：鼠标到音符图形边缘外还有这么多像素也算命中。
 ## Tap / Hold 头 / Path 头 / Anchor 共用这一把尺子（再各自加上图形半径）。
 const POSITION_TOLERANCE_PX := 120.0
 ## 光标离图形中线这么近就算“指着这颗”：分配按键时优先于时间更近的邻键。
 const ON_SHAPE_PX := 20.0
-## 比较按键归属时给“晚于音符”的匹配加一点代价：漏掉前一颗后，
-## 下一按不会立刻被前一颗补判走（那是“蹭”的另一半）。
-const LATE_PENALTY_MS := 10.0
+## 比较按键归属时给“晚于音符”的匹配加 40ms 代价：漏掉前一颗后，
+## 下一按优先给即将到来的那颗，不会连锁被前一颗补判走。
+const LATE_PENALTY_MS := 40.0
 ## 刚命中一颗后这么短时间内的额外按键，不再允许提前吃下一颗（防手指蹭键）。
 const STRAY_GUARD_MS := 50.0
 const HOLD_ARC_PAD := 10.0
@@ -108,6 +111,9 @@ var _tick_index: int = -1
 var _tick_player: AudioStreamPlayer = null
 var _setup_token: int = 0
 var _ordered_notes: Array[Note] = []
+## 双押 Anchor：每对的 owner id（较小的一方负责判定），按 id 取 Note。
+var _anchor_owner_ids: Array[int] = []
+var _note_index: Dictionary = {}
 var _ui_accum: float = 0.0
 
 var _states: Dictionary = {}
@@ -115,6 +121,8 @@ var _key_presses: Array[Dictionary] = []
 ## 最近一次真正被按键命中的时间：用来识别“刚打完又蹭一下”的额外按键。
 var _last_hit_press_ms: float = -1.0e9
 var _seek_presses: Array[Dictionary] = []
+var _last_seek_orien: int = -1
+var _last_seek_ms: float = -1.0e9
 ## 上一帧的实际间隔（ms）：输入每帧刷新一次，按键只可能落在这段时间里。
 var _last_frame_ms: float = 16.7
 ## 连续多少个统计窗口装不下目标帧：用来给弱机自动降画质。
@@ -536,8 +544,8 @@ func _refresh_pause_status() -> void:
 		_mouse_keys_toggle.set_pressed_no_signal(bool(_app.mouse_keys))
 	var skin_label := String(Preview3D.skin_presets().get(_preview.note_skin, {}).get("label", _preview.note_skin))
 	var fx_label := String(Preview3D.hit_fx_presets().get(_preview.hit_fx_style, _preview.hit_fx_style))
-	_pause_style.text = "皮肤 %s · 特效 %s%s" % [skin_label, fx_label, " · AUTO" if auto_play else ""]
-	_pause_tiers.text = "PERFECT %d · GREAT %d · GOOD %d · BAD %d · MISS %d" % [
+	_pause_style.text = "皮肤 %s，特效 %s%s" % [skin_label, fx_label, "，AUTO" if auto_play else ""]
+	_pause_tiers.text = "PERFECT %d   GREAT %d   GOOD %d   BAD %d   MISS %d" % [
 		int(_tier_counts.get("PERFECT", 0)), int(_tier_counts.get("GREAT", 0)),
 		int(_tier_counts.get("GOOD", 0)), int(_tier_counts.get("BAD", 0)),
 		int(_tier_counts.get("MISS", 0))]
@@ -655,6 +663,8 @@ func _init_states() -> void:
 	_key_presses.clear()
 	_last_hit_press_ms = -1.0e9
 	_seek_presses.clear()
+	_last_seek_orien = -1
+	_last_seek_ms = -1.0e9
 	_last_frame_ms = 16.7
 	_slow_windows = 0
 	_last_press_ms.clear()
@@ -704,15 +714,30 @@ func _init_states() -> void:
 			"path_tail_perfect_early_ms": TAIL_PERFECT_MS,
 			"slide_cued": false,
 			"path_auto_index": 0,
-			"trace_started": false,
-			"trace_distance": 0.0,
-			"trace_last": Vector2.ZERO,
-			"trace_contact": false,
-			"trace_frac": 0.0,
-			"trace_away": 0.0,
-			"trace_reset": false,
 			"armed": false,
 		}
+	# 双押 Anchor：一对只由 owner 判定，找出同拍反向的伙伴。
+	_note_index.clear()
+	_anchor_owner_ids.clear()
+	for note in _ordered_notes:
+		_note_index[note.id] = note
+	var paired: Dictionary = {}
+	for note in _ordered_notes:
+		if note.type != "anchor" or paired.has(note.id):
+			continue
+		var partner := chart.anchor_partner(note)
+		if partner == null:
+			_states[note.id]["anchor_unpaired"] = true
+			continue
+		var owner := note if note.id < partner.id else partner
+		var other := partner if owner == note else note
+		paired[owner.id] = true
+		paired[other.id] = true
+		_states[owner.id]["anchor_owner"] = true
+		_states[owner.id]["anchor_pair_id"] = other.id
+		_states[owner.id]["anchor_pending"] = []
+		_states[other.id]["anchor_pair_id"] = owner.id
+		_anchor_owner_ids.append(owner.id)
 	# 从读头/回退点之后开始：起点之前的音符不判、不计分，避免一进局就一串 MISS。
 	for note in _ordered_notes:
 		var state: Dictionary = _states[note.id]
@@ -993,7 +1018,6 @@ func _auto_step(ms: float, beat: float, _delta: float) -> void:
 			break
 		_auto_press_note(note, state, beat)
 		_auto_index += 1
-	_auto_feed_trace(ms)
 	_auto_release_holds(ms)
 
 
@@ -1018,26 +1042,6 @@ func _auto_press_note(note: Note, state: Dictionary, beat: float) -> void:
 		_auto_hold_keys[note.id] = {"key": key, "end_ms": float(state["end_ms"])}
 
 
-## Trace 判定的是「鼠标走过的总距离」。轨迹比 move_px 短时真人也会来回蹭，
-## AUTO 直接把差的距离补上，保证演示一定打得完。
-func _auto_feed_trace(ms: float) -> void:
-	var star_speed := float(_app.star_speed if _app != null else 1.0)
-	var last := mini(_ordered_notes.size(), _judge_from + 64)
-	for i in range(maxi(0, _judge_from), last):
-		var note := _ordered_notes[i]
-		if note.type != "trace":
-			continue
-		var state: Dictionary = _states[note.id]
-		if bool(state.get("done", false)) or not bool(state.get("trace_started", false)):
-			continue
-		if ms > float(state["end_ms"]) + 200.0:
-			continue
-		var required := note.move_px * star_speed
-		if float(state["trace_distance"]) < required:
-			state["trace_distance"] = required
-		return
-
-
 func _auto_release_holds(ms: float) -> void:
 	for note_id in _auto_hold_keys.keys():
 		var info: Dictionary = _auto_hold_keys[note_id]
@@ -1047,7 +1051,7 @@ func _auto_release_holds(ms: float) -> void:
 		_auto_hold_keys.erase(note_id)
 
 
-## AUTO 光标往哪放：Bell 的窗口很短先满足它，其次 Path/Trace 的身体期，否则待机。
+## AUTO 光标往哪放：Bell 的窗口很短先满足它，其次 Path 的身体期，否则待机。
 func _auto_cursor_target(ms: float, beat: float) -> Vector2:
 	var center: Vector2 = _preview.project_design(Vector2.ZERO)
 	if not center.is_finite():
@@ -1062,7 +1066,9 @@ func _auto_cursor_target(ms: float, beat: float) -> Vector2:
 			continue
 		var target := float(state["target_ms"])
 		var end_ms := float(state["end_ms"])
-		if ms > end_ms + 200.0:
+		# 单点音符（Bell 等）的 end_ms 可能是 0；用目标时间兜底，
+		# 否则它们会在这里被当成“早就过去了”，AUTO 光标永远不去接。
+		if ms > maxf(end_ms, target) + 200.0:
 			continue
 		match note.type:
 			"bell":
@@ -1070,7 +1076,7 @@ func _auto_cursor_target(ms: float, beat: float) -> Vector2:
 					var bell: Dictionary = _preview.bell_screen(note, beat)
 					if not bell.is_empty():
 						bell_point = bell["center"]
-			"path", "trace":
+			"path":
 				if not body.is_finite() and ms >= target - AUTO_PREVIEW_MS and ms <= end_ms + 120.0:
 					body = _auto_body_point(note, ms, beat, end_ms)
 	if bell_point.is_finite():
@@ -1085,16 +1091,9 @@ func _auto_cursor_target(ms: float, beat: float) -> Vector2:
 	return _auto_avoid_red(idle, beat, center)
 
 
-## Path 的进度点 / Trace 的进度采样点。
+## Path 的进度点。
 func _auto_body_point(note: Note, ms: float, beat: float, end_ms: float) -> Vector2:
-	if note.type == "path":
-		return _auto_path_point(note, ms, beat, end_ms)
-	var points: PackedVector2Array = _preview.trace_screen_points(note, beat)
-	if points.size() < 2:
-		return _preview.note_head_screen(note, beat)
-	var q := clampf((beat - note.beat) / maxf(0.001, note.duration()), 0.0, 1.0)
-	var index := clampi(int(round(q * float(points.size() - 1))), 0, points.size() - 1)
-	return points[index]
+	return _auto_path_point(note, ms, beat, end_ms)
 
 
 ## Path 的尾巴是「光标靠近就算」，半径 192px 很大：离判定时间还远时，
@@ -1172,6 +1171,7 @@ func _toggle_auto() -> void:
 
 
 func _judge_all(ms: float, beat: float, delta: float) -> void:
+	_judge_anchor_pairs(ms, beat)
 	_assign_presses(ms, beat)
 	var mouse: Vector2 = _preview.mouse_screen
 	for i in range(_judge_from, _ordered_notes.size()):
@@ -1206,8 +1206,6 @@ func _judge_all(ms: float, beat: float, delta: float) -> void:
 				_judge_path(note, ms, beat, mouse)
 			"seek":
 				_judge_seek(note, ms, beat)
-			"trace":
-				_judge_trace(note, ms, beat, delta, mouse)
 			"anchor":
 				_judge_anchor(note, ms, beat)
 			"bell":
@@ -1242,7 +1240,7 @@ func _judge_seek(note: Note, ms: float, beat: float) -> void:
 		state["done"] = true
 		_preview.set_note_state(note.id, "hit")
 		_register_hit("PERFECT")
-		var color := UITheme.SEEK_IN if note.seek_orien == 0 else UITheme.SEEK_OUT
+		var color := UITheme.SEEK_IN if note.seek_orien == 1 else UITheme.SEEK_OUT
 		_pulse_at(0.0, beat, color, "PERFECT", 360.0, "seek", "SEEK", _preview.project_design(Vector2.ZERO))
 		_sfx.play("bell", randf_range(0.98, 1.02))
 		_record_error(float(press["time"]) - target, "Seek #%d PERFECT" % note.id, "PERFECT", float(press["time"]))
@@ -1618,119 +1616,6 @@ func _record_path_input_frame(note: Note, state: Dictionary, tracker: PathProgre
 	_write_path_input_log(record)
 
 
-func _judge_trace(note: Note, ms: float, beat: float, delta: float, mouse: Vector2) -> void:
-	var state: Dictionary = _states[note.id]
-	var start_ms := float(_states[note.id]["target_ms"])
-	var end_ms := float(_states[note.id]["end_ms"])
-	var contact := _trace_contact(note, mouse, beat)
-	if not state["trace_started"]:
-		if ms < start_ms - EARLY_MS:
-			return
-		var started := false
-		if note.trace_style == "slider":
-			var press := _take_assigned_press(note.id)
-			if not press.is_empty():
-				started = true
-				_sfx.play("path", 0.94)
-		elif contact:
-			started = true
-		if started:
-			state["trace_started"] = true
-			state["trace_contact"] = true
-			state["trace_last"] = mouse
-			_add_log("TRACE #%d CONTACT" % note.id)
-			return
-		if ms > start_ms + HIT_WINDOW_MS:
-			state["done"] = true
-			_miss_count += 1
-			_combo = 0
-			_add_log("MISS Trace #%d (no contact)" % note.id)
-		return
-	if String(chart.metadata.get("slide_mode", "follow")) == "maimai":
-		# 舞萌扫圈：鼠标经过的轨迹抹掉，头部按键后只要结束窗口内仍碰到轨迹就完成。
-		if contact:
-			var sweep := _preview.trace_fraction(note, mouse, beat)
-			var sweep_frac := float(sweep.get("fraction", 0.0))
-			var sweep_prev := float(state.get("trace_frac", 0.0))
-			if sweep_frac > sweep_prev + 0.02:
-				_preview.cut_trace(note, sweep_prev, sweep_frac)
-				state["trace_frac"] = sweep_frac
-		if contact and ms >= end_ms - HIT_WINDOW_MS:
-			state["done"] = true
-			_hit_count += 1
-			_combo += 1
-			_max_combo = maxi(_max_combo, _combo)
-			_add_judgement("PERFECT")
-			_preview.add_hit_pulse(mouse, UITheme.MINT, "PERFECT", "trace")
-			_sfx.play("trace", randf_range(0.97, 1.03))
-			_add_log("TRACE #%d SWEEP HIT" % note.id)
-			return
-		if ms > end_ms + HIT_WINDOW_MS:
-			state["done"] = true
-			_miss_count += 1
-			_add_judgement("MISS")
-			_combo = 0
-			_preview.add_hit_pulse(mouse, UITheme.RED, "MISS", "trace")
-			_add_log("MISS Trace #%d (sweep)" % note.id)
-		return
-	if contact:
-		var info: Dictionary = _preview.trace_fraction(note, mouse, beat)
-		var fraction := float(info.get("fraction", 0.0))
-		var distance_to_path := float(info.get("distance", INF))
-		if state["trace_contact"]:
-			var last: Vector2 = state["trace_last"]
-			var step := last.distance_to(mouse)
-			var previous_fraction := float(state.get("trace_frac", 0.0))
-			var jumped := fraction >= previous_fraction + 0.02 and step > 60.0 and distance_to_path <= TRACE_CONTACT_PX
-			if jumped:
-				# 鼠标向前跳区：跳过的段落从画面削掉，且不累计移动距离。
-				_preview.cut_trace(note, previous_fraction, fraction)
-			elif fraction + 0.02 >= previous_fraction:
-				state["trace_distance"] = float(state["trace_distance"]) + step
-			state["trace_frac"] = maxf(previous_fraction, fraction)
-		state["trace_contact"] = true
-		state["trace_last"] = mouse
-	else:
-		state["trace_contact"] = false
-		state["trace_away"] = float(state.get("trace_away", 0.0)) + delta
-		if float(state["trace_away"]) > 0.25 and not bool(state.get("trace_reset", false)):
-			# 离开轨迹超过 250ms：保留宽限后重置已累计距离，需要重新跟一遍。
-			state["trace_reset"] = true
-			state["trace_distance"] = 0.0
-			_add_log("TRACE #%d FRAY (left path >250ms)" % note.id)
-	if contact:
-		state["trace_away"] = 0.0
-		state["trace_reset"] = false
-	var required := note.move_px * float(_app.star_speed if _app != null else 1.0)
-	if float(state["trace_distance"]) >= required:
-		state["done"] = true
-		_hit_count += 1
-		_combo += 1
-		_max_combo = maxi(_max_combo, _combo)
-		_add_judgement("PERFECT")
-		_preview.add_hit_pulse(mouse, UITheme.MINT, "PERFECT", "trace")
-		_sfx.play("trace", randf_range(0.97, 1.03))
-		_add_log("TRACE #%d HIT (%.0f/%.0f px)" % [note.id, float(state["trace_distance"]), required])
-		return
-	if ms > end_ms + HIT_WINDOW_MS:
-		state["done"] = true
-		_miss_count += 1
-		_add_judgement("MISS")
-		_combo = 0
-		if _preview != null:
-			_preview.add_hit_pulse(mouse, UITheme.RED, "MISS", "trace")
-		_add_log("MISS Trace #%d (distance %.0f/%.0f)" % [note.id, float(state["trace_distance"]), required])
-
-
-func _trace_contact(note: Note, mouse: Vector2, beat: float) -> bool:
-	if note.trace_pts.size() < 2:
-		return false
-	var polyline: Array[Vector2] = []
-	for point in _preview.trace_screen_points(note, beat):
-		polyline.append(point)
-	return JudgeMath.trace_distance(mouse, polyline) <= TRACE_CONTACT_PX
-
-
 func _judge_bell(note: Note, ms: float, beat: float, mouse: Vector2) -> void:
 	var state: Dictionary = _states[note.id]
 	var target := float(state["target_ms"])
@@ -1771,24 +1656,139 @@ func _judge_bell(note: Note, ms: float, beat: float, mouse: Vector2) -> void:
 		if not missed.is_empty():
 			_pulse_at(note.center_u * 360.0, beat, UITheme.RED, "MISS", note.bell_width(), "tap", "", missed["center"])
 		_add_log("MISS Bell #%d @%.0fms" % [note.id, target])
+		var dbg: Dictionary = _preview.bell_screen(note, beat)
+		print("[bell-debug] id=%d beat=%.2f mouse=%s center=%s d=%.1f armed=%s sweep_tol=%.0f red=%s" % [
+			note.id, beat, mouse, dbg.get("center", Vector2.INF),
+			mouse.distance_to(dbg.get("center", mouse)) if not dbg.is_empty() else -1.0,
+			state.get("armed", false), Preview3D.BELL_RADIAL_TOLERANCE,
+			_inside_red(mouse, beat)])
 
 
+## 双押 Anchor：一对算一个判定单元。窗口与 Tap 相同；
+## 光标在任一锚点 140px 内、两次按键相差 ≤40ms 才成立，档位取较差的一次。
+## 命中与失误都只记一次，连击与准确率也只算一个样本。
+func _judge_anchor_pairs(ms: float, beat: float) -> void:
+	for owner_id in _anchor_owner_ids:
+		var state: Dictionary = _states[owner_id]
+		if bool(state.get("done", false)):
+			continue
+		var target := float(state["target_ms"])
+		if ms < target - EARLY_MS:
+			continue
+		var partner_id := int(state.get("anchor_pair_id", -1))
+		if not _states.has(partner_id):
+			continue
+		var partner_state: Dictionary = _states[partner_id]
+		var owner_note: Note = _note_index.get(owner_id)
+		var partner_note: Note = _note_index.get(partner_id)
+		var pa := _preview.note_head_screen(owner_note, beat)
+		var pb := _preview.note_head_screen(partner_note, beat)
+		var tolerance := POSITION_TOLERANCE_PX + float(_preview.note_graphic_radius("anchor"))
+		var pending: Array = state.get("anchor_pending", [])
+		# 第一键只留 40ms 等第二键；超时就不算同一组多押。
+		var fresh_pending: Array = []
+		for press in pending:
+			if ms - float(press.get("time", -INF)) <= ANCHOR_SYNC_MS:
+				fresh_pending.append(press)
+		pending = fresh_pending
+		# 只把“在任一锚点附近”的按键收进这一对，别的音符照常分配。
+		var kept_presses: Array[Dictionary] = []
+		for press in _key_presses:
+			var lo := float(press.get("lo", press.get("time", 0.0)))
+			var hi := float(press.get("hi", press.get("time", 0.0)))
+			if hi < target - EARLY_MS or lo > target + HIT_WINDOW_MS:
+				kept_presses.append(press)
+				continue
+			var point: Vector2 = press.get("mouse", Vector2.INF)
+			if not _near_anchor(point, pa, pb, tolerance):
+				kept_presses.append(press)
+				continue
+			pending.append(press)
+		_key_presses = kept_presses
+		state["anchor_pending"] = pending
+		var picked := _pick_anchor_pair(pending, target)
+		if not picked.is_empty():
+			var press_a: Dictionary = picked["a"]
+			var press_b: Dictionary = picked["b"]
+			var worse := float(picked["error"])
+			var tier := _tier_for(worse)
+			state["done"] = true
+			partner_state["done"] = true
+			state["anchor_pending"] = []
+			_preview.set_note_state(owner_id, "hit")
+			_preview.set_note_state(partner_id, "hit")
+			_preview.add_note_pop("anchor", owner_note, beat)
+			_preview.add_note_pop("anchor", partner_note, beat)
+			# 两颗都算完整命中：连击 +2、准确率两个样本、档位计数 +2。
+			_register_hit(tier)
+			_register_hit(tier)
+			# 判定字放在玩家实际靠近的那颗锚点上。
+			var aim_angle := owner_note.angle
+			var aim_mouse: Vector2 = press_a.get("mouse", pa)
+			if aim_mouse.distance_to(pb) < aim_mouse.distance_to(pa):
+				aim_angle = partner_note.angle
+			_pulse_at(aim_angle, beat, _tier_color(tier), tier, 70.0, "tap", _timing_detail(worse, tier))
+			_sfx.play("anchor", 1.0)
+			_record_error(worse, "ANCHOR PAIR #%d/#%d %s" % [owner_id, partner_id, tier], tier,
+				float(picked["time"]))
+			continue
+		if ms > target + HIT_WINDOW_MS:
+			state["done"] = true
+			partner_state["done"] = true
+			state["anchor_pending"] = []
+			_preview.set_note_state(owner_id, "miss")
+			_preview.set_note_state(partner_id, "miss")
+			_miss_count += 1
+			_add_judgement("MISS")
+			_combo = 0
+			_pulse_at(owner_note.angle, beat, UITheme.RED, "MISS", 70.0)
+			_add_log("MISS Anchor PAIR #%d/#%d" % [owner_id, partner_id])
+
+
+## 从候选按键里找一对：不同物理键、时间差 ≤40ms、各在自己的窗口内。
+## 返回较差那次的带符号误差，用来取档位。
+static func _pick_anchor_pair(presses: Array, target: float) -> Dictionary:
+	var best: Dictionary = {}
+	var best_cost := INF
+	for i in presses.size():
+		var a: Dictionary = presses[i]
+		var error_a := press_error(a, target)
+		if absf(error_a) > HIT_WINDOW_MS:
+			continue
+		for j in range(i + 1, presses.size()):
+			var b: Dictionary = presses[j]
+			if int(a.get("key", 0)) == int(b.get("key", 0)):
+				continue
+			if absf(float(a.get("time", 0.0)) - float(b.get("time", 0.0))) > ANCHOR_SYNC_MS:
+				continue
+			var error_b := press_error(b, target)
+			if absf(error_b) > HIT_WINDOW_MS:
+				continue
+			var cost := maxf(absf(error_a), absf(error_b))
+			if cost >= best_cost:
+				continue
+			best_cost = cost
+			best = {
+				"a": a,
+				"b": b,
+				"error": error_a if absf(error_a) >= absf(error_b) else error_b,
+				"time": maxf(float(a.get("time", 0.0)), float(b.get("time", 0.0))),
+			}
+	return best
+
+
+static func _near_anchor(point: Vector2, a: Vector2, b: Vector2, tolerance: float) -> bool:
+	if not point.is_finite():
+		return false
+	return point.distance_to(a) <= tolerance or point.distance_to(b) <= tolerance
+
+
+## 成对的 Anchor 已经在 _judge_anchor_pairs 里整对结算；这里只兜底单颗旧谱。
 func _judge_anchor(note: Note, ms: float, beat: float) -> void:
 	var state: Dictionary = _states[note.id]
+	if not bool(state.get("anchor_unpaired", false)):
+		return
 	var target := float(state["target_ms"])
-	if ms < target - EARLY_MS:
-		return
-	var press := _take_assigned_press(note.id)
-	if not press.is_empty():
-		var anchor_error := press_error(press, target)
-		var tier := _tier_for(anchor_error)
-		state["done"] = true
-		_preview.set_note_state(note.id, "hit")
-		_register_hit(tier)
-		_pulse_at(note.angle, beat, _tier_color(tier), tier, note.arc_width(), "tap", _timing_detail(anchor_error, tier))
-		_sfx.play("anchor", 1.0)
-		_record_error(float(press["time"]) - target, "ANCHOR #%d %s" % [note.id, tier], tier, float(press["time"]))
-		return
 	if ms > target + HIT_WINDOW_MS:
 		state["done"] = true
 		_preview.set_note_state(note.id, "miss")
@@ -1796,7 +1796,7 @@ func _judge_anchor(note: Note, ms: float, beat: float) -> void:
 		_add_judgement("MISS")
 		_combo = 0
 		_pulse_at(note.angle, beat, UITheme.RED, "MISS", 70.0)
-		_add_log("MISS Anchor #%d" % note.id)
+		_add_log("MISS Anchor #%d (unpaired)" % note.id)
 
 
 func _judge_red(ms: float, beat: float, delta: float, mouse: Vector2) -> void:
@@ -1914,6 +1914,14 @@ static func press_is_stray(stamp: float, target: float, last_hit: float) -> bool
 	return stamp < target - PERFECT_MS and stamp > last_hit + 0.1 and stamp - last_hit < STRAY_GUARD_MS
 
 
+## 滚轮只认“干净”的方向：反向后 SEEK_REVERSE_GUARD_MS 内的再次反向丢弃。
+## 上下交替蹭轮永远凑不出有效方向；同向连滚照常算。
+static func seek_tick_allowed(orien: int, last_orien: int, since_ms: float) -> bool:
+	if last_orien < 0 or orien == last_orien:
+		return true
+	return since_ms >= SEEK_REVERSE_GUARD_MS
+
+
 ## 按键分配排序：光标压在图形上的那颗优先；否则按“时间误差 + 晚到代价”，再按距离。
 static func prefer_press_pair(a: Dictionary, b: Dictionary) -> bool:
 	if bool(a["on_shape"]) != bool(b["on_shape"]):
@@ -1958,18 +1966,8 @@ func _press_target(note: Note, ms: float, beat: float) -> Dictionary:
 				PackedVector2Array([_preview.note_head_screen(note, beat)]),
 				POSITION_TOLERANCE_PX + float(_preview.note_graphic_radius("path")), 0.0)
 		"anchor":
-			return _shape_target(note, target - EARLY_MS, target + HIT_WINDOW_MS, target,
-				PackedVector2Array([_preview.note_head_screen(note, beat)]),
-				POSITION_TOLERANCE_PX + float(_preview.note_graphic_radius(note.type)), 0.0)
-		"trace":
-			if bool(state.get("trace_started", false)) or note.trace_style != "slider":
-				return {}
-			var trace := _preview.trace_screen_points(note, beat)
-			if trace.is_empty():
-				return {}
-			return {"id": note.id, "note": note, "lo": target - EARLY_MS, "hi": target + HIT_WINDOW_MS,
-				"target": target, "points": PackedVector2Array([trace[0]]),
-				"tolerance": TRACE_HEAD_RADIUS, "pad": 0.0, "dense": false}
+			# 成对 Anchor 由 _judge_anchor_pairs 整对收键，不走单键分配。
+			return {}
 	return {}
 
 
@@ -2360,13 +2358,19 @@ func _input(event: InputEvent) -> void:
 			_queue_path_motion(point, _chart_ms() + float(_app.playtest_offset_ms if _app != null else 0.0))
 		return
 	if event is InputEventMouseButton and event.pressed and (event.button_index == MOUSE_BUTTON_WHEEL_UP or event.button_index == MOUSE_BUTTON_WHEEL_DOWN):
-		var span := _input_interval(_chart_ms() + float(_app.playtest_offset_ms if _app != null else 0.0))
-		_seek_presses.append({
-			"time": (span.x + span.y) * 0.5,
-			"lo": span.x,
-			"hi": span.y,
-			"orien": 0 if event.button_index == MOUSE_BUTTON_WHEEL_UP else 1,
-		})
+		var now_ms := _chart_ms() + float(_app.playtest_offset_ms if _app != null else 0.0)
+		var span := _input_interval(now_ms)
+		var orien := 0 if event.button_index == MOUSE_BUTTON_WHEEL_UP else 1
+		if seek_tick_allowed(orien, _last_seek_orien, now_ms - _last_seek_ms):
+			_seek_presses.append({
+				"time": (span.x + span.y) * 0.5,
+				"lo": span.x,
+				"hi": span.y,
+				"orien": orien,
+			})
+		# 被丢弃的那一笔也要记账，否则上下交替时每一笔都被上一次同向放行。
+		_last_seek_orien = orien
+		_last_seek_ms = now_ms
 		get_viewport().set_input_as_handled()
 		return
 	if event is InputEventMouseButton and (event.button_index == MOUSE_BUTTON_LEFT or event.button_index == MOUSE_BUTTON_RIGHT):
@@ -2490,7 +2494,7 @@ func _finish() -> void:
 			span = chart.timing.beat_to_chart_ms(chart.duration_beats()) + float(_app.playtest_offset_ms if _app != null else 0.0)
 		_scatter_chart.set_hits(_scatter, span)
 	if _bias_label != null:
-		_bias_label.text = "平均判定偏差 %+.2f 毫秒   ·   不稳定率 (UR) %.2f   ·   样本 %d   ·   当前 offset %+.0fms" % [
+		_bias_label.text = "平均判定偏差 %+.2f 毫秒    不稳定率 (UR) %.2f    样本 %d    当前 offset %+.0fms" % [
 			average_error,
 			_unstable_rate(),
 			_errors.size(),
